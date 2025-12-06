@@ -74,6 +74,7 @@ def create_time_features(df):
 
     return df.dropna().reset_index(drop=True)
 
+# 🛑 AICI ÎNCĂRCĂM DATELE TALE
 try:
     df_raw = pd.read_csv("Dataset.csv")
     df_raw = df_raw.sort_values(by='Time interval (CET/CEST)', key=lambda x: pd.to_datetime(x.str.split(' - ').str[0], format="%d.%m.%Y %H:%M")).reset_index(drop=True)
