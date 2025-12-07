@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. CONSTANTS AND PARAMETERS
+# 0. CONSTANTS ȘI PARAMETRI
 # ==============================================================================
 
 NUM_DAYS = 8
@@ -20,26 +20,31 @@ INTERVALS_PER_HOUR = 4
 INTERVALS_PER_DAY = 24 * INTERVALS_PER_HOUR # 96
 TOTAL_INTERVALS = NUM_DAYS * INTERVALS_PER_DAY # 768
 
-C_MAX = 10.0 # Battery Capacity (MWh)
-P_MAX = 10.0 # Max Power/Position
-SOC_START = 5.0 # Initial SoC at 00:00
-MIN_TRANZACTIE = 0.1 # Minimum transaction magnitude
+C_MAX = 10.0 
+P_MAX = 10.0 
+SOC_START = 5.0 
+MIN_TRANZACTIE = 0.1 
 
-# ROBUST MILP BOUNDS:
-# We keep the 0.01 margin. It provides numerical stability for the solver
-# without significantly impacting the profit potential.
+# ROBUST MILP BOUNDS
 SOC_MIN_MILP = 0.01
 SOC_MAX_MILP = C_MAX - 0.01 
 
-# LightGBM Parameters (Conservative & Robust)
-N_ESTIMATORS = 350 
+# Ensemble weighting (Balanced 50/50 for maximum generalization)
+ALPHA_LGBM = 0.5          
+ALPHA_XGB = 0.5
+
+# Smoothing window (Reduced to 3 for sharpness)
+SMOOTHING_WINDOW = 3 # 45 minutes
+
+# LightGBM Parameters (High Precision)
+N_ESTIMATORS = 600 # Increased for detail
 LGBM_PARAMS = {
     'objective': 'regression_l1',
     'metric': 'mae',
     'n_estimators': N_ESTIMATORS,
-    'learning_rate': 0.03,
+    'learning_rate': 0.015, # Very slow, precise learning
     'num_leaves': 128,
-    'max_depth': 8,
+    'max_depth': 10,
     'subsample': 0.8,
     'colsample_bytree': 0.8,
     'reg_alpha': 1.0,
@@ -50,22 +55,21 @@ LGBM_PARAMS = {
     'seed': 42
 }
 
-# XGBoost Parameters (Conservative & Robust)
+# XGBoost Parameters
 XGB_PARAMS = {
     'objective': 'reg:squarederror',
     'n_estimators': N_ESTIMATORS,
-    'learning_rate': 0.05,
-    'max_depth': 6,
+    'learning_rate': 0.03, # Tuned for ensemble
+    'max_depth': 8,        
     'n_jobs': -1,
     'seed': 42
 }
 
 # ==============================================================================
-# 1. DATA PREPARATION AND FEATURE ENGINEERING
+# 1. PREGATIREA DATELOR ȘI FEATURE ENGINEERING
 # ==============================================================================
 
 def create_time_features(df):
-    
     if 'Start' not in df.columns:
         df['Start'] = pd.to_datetime(df['Time interval (CET/CEST)'].str.split(' - ').str[0], format="%d.%m.%Y %H:%M")
 
@@ -77,19 +81,24 @@ def create_time_features(df):
     df['month'] = df['Start'].dt.month
     df['year'] = df['Start'].dt.year
     df['is_weekend'] = (df['dow'] >= 5).astype(int)
-    
-    # Sinusoidal features (Critical for Cyclical Generalization)
-    df['hour_sin'] = np.sin(2 * np.pi * (df['hour'] + df.minute/60) / 24)
-    df['hour_cos'] = np.cos(2 * np.pi * (df['hour'] + df.minute/60) / 24)
+
+    # Sinusoidal features
+    df['hour_sin'] = np.sin(2 * np.pi * (df['hour'] + df['minute'] / 60) / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * (df['hour'] + df['minute'] / 60) / 24)
     df['dow_sin'] = np.sin(2 * np.pi * df['dow'] / 7)
     df['dow_cos'] = np.cos(2 * np.pi * df['dow'] / 7)
     
-    # Lag Features (The Stable Set)
-    # We intentionally AVOID recursive rolling means here to prevent drift.
+    # Lag Features (The Stable Core)
     if 'Price' in df.columns:
         df['price_lag_96'] = df['Price'].shift(96)     # 24 hours
         df['price_lag_48'] = df['Price'].shift(48)     # 12 hours
         df['price_lag_672'] = df['Price'].shift(672)   # 7 days
+        
+        # 💥 NEW SAFE FEATURE: Rolling Stats on the 24h LAG
+        # "What was the average price 24 hours ago (over a 1-hour window)?"
+        # This adds trend context WITHOUT using recursive predictions. It is safe.
+        df['lag96_roll_mean_4'] = df['price_lag_96'].rolling(window=4, min_periods=1).mean()
+        df['lag96_roll_std_4'] = df['price_lag_96'].rolling(window=4, min_periods=1).std()
 
     return df.dropna().reset_index(drop=True)
 
@@ -103,13 +112,17 @@ try:
     EXCLUDE_COLS = ['Time interval (CET/CEST)', 'Start', 'Price']
     FEATURE_COLS = [col for col in df_train.columns if col not in EXCLUDE_COLS]
     
-    MAX_LAG = 672 
+    MAX_LAG = 672
+    
+    # Relaxed Clipping (0.001 - 0.999) to catch more profit
+    PRICE_Q_LOW = df_train['Price'].quantile(0.001)
+    PRICE_Q_HIGH = df_train['Price'].quantile(0.999)
 
-    print("1. Historical data loaded and preprocessed.")
-    print(f"   Training rows count: {len(df_train)}")
+    print("1. Historical data loaded.")
+    print(f"   Training rows: {len(df_train)}")
 
 except FileNotFoundError:
-    print("ERROR: 'Dataset.csv' file not found. Cannot proceed.")
+    print("ERROR: 'Dataset.csv' file not found.")
     exit()
 
 # ==============================================================================
@@ -122,8 +135,7 @@ y = df_train['Price']
 X_train, X_val = X.iloc[:-96], X.iloc[-96:]
 y_train, y_val = y.iloc[:-96], y.iloc[-96:]
 
-# Ensemble Training
-print("\n2. Training LightGBM and XGBoost Ensemble...")
+print("\n2. Training Ensemble...")
 lgbm = lgb.LGBMRegressor(**LGBM_PARAMS)
 xgb_model = xgb.XGBRegressor(**XGB_PARAMS)
 
@@ -134,41 +146,37 @@ lgbm.fit(
     callbacks=[lgb.early_stopping(50, verbose=False)]
 )
 
-# Removed early_stopping_rounds for compatibility
-xgb_model.fit(X_train, y_train, 
-              eval_set=[(X_val, y_val)], 
-              verbose=False)
+xgb_model.fit(
+    X_train, y_train,
+    eval_set=[(X_val, y_val)],
+    verbose=False
+)
 
 print(f"   Training finished.")
-
 
 # ==============================================================================
 # 3. ITERATIVE PREDICTION
 # ==============================================================================
 
-# Prediction Data Preparation
+# Prediction Prep
 last_time_str = df_raw['Time interval (CET/CEST)'].str.split(' - ').str[0].iloc[-1]
 last_time = pd.to_datetime(last_time_str, format="%d.%m.%Y %H:%M")
-
 future_timestamps = [last_time + pd.Timedelta(minutes=15 * (i + 1)) for i in range(TOTAL_INTERVALS)]
 
 df_pred = pd.DataFrame({'Start': future_timestamps})
-df_pred['Time interval (CET/CEST)'] = df_pred['Start'].apply(lambda x: x.strftime("%d.%m.%Y %H:%M"))
+df_pred['Time interval (CET/CEST)'] = df_pred['Start'].dt.strftime("%d.%m.%Y %H:%M")
 
 df_pred_template = create_time_features(df_pred.copy())
-
-# Reset lags for prediction
-for col in ['price_lag_96', 'price_lag_48', 'price_lag_672']:
+# Reset dynamic columns
+for col in ['price_lag_96', 'price_lag_48', 'price_lag_672', 'lag96_roll_mean_4', 'lag96_roll_std_4']:
     if col in FEATURE_COLS:
         df_pred_template[col] = 0.0
 
-X_pred_template = df_pred_template[FEATURE_COLS].copy() 
+X_pred_template = df_pred_template[FEATURE_COLS].copy()
 
+print("3. Iterative Ensemble Prediction...")
 
-# Iterative Prediction Loop
-print("3. Iterative Ensemble Prediction (8 days)...")
-
-full_history = df_train['Price'].iloc[-MAX_LAG:].tolist() 
+full_history = df_train['Price'].iloc[-MAX_LAG:].tolist()
 predicted_prices = []
 
 for i in tqdm(range(TOTAL_INTERVALS), desc="Predicting"):
@@ -176,29 +184,38 @@ for i in tqdm(range(TOTAL_INTERVALS), desc="Predicting"):
     
     X_pred_row = X_pred_template.iloc[[i]].copy()
     
-    # Update Lag Features
-    # Since we only use fixed offsets (96, 48, 672), we just look back in the history.
-    # This is STABLE because we are not calculating means on the predictions themselves.
-    X_pred_row.loc[X_pred_row.index[0], 'price_lag_96'] = full_history[current_idx_in_history - 95]
+    # Update Lags (Known history)
+    lag96_val = full_history[current_idx_in_history - 95]
+    X_pred_row.loc[X_pred_row.index[0], 'price_lag_96'] = lag96_val
     X_pred_row.loc[X_pred_row.index[0], 'price_lag_48'] = full_history[current_idx_in_history - 47]
     X_pred_row.loc[X_pred_row.index[0], 'price_lag_672'] = full_history[current_idx_in_history - 671]
     
-    # Ensemble Prediction (Average)
-    pred_lgbm = lgbm.predict(X_pred_row)[0]
-    pred_xgb = xgb_model.predict(X_pred_row)[0]
-    pred_val = (pred_lgbm + pred_xgb) / 2
+    # Update Rolling on Lags (Safe)
+    # Get the slice of history around t-96 to calculate roll stats
+    # Indices: t-96-3, t-96-2, t-96-1, t-96 (Window=4)
+    idx_center = current_idx_in_history - 95
+    hist_slice = full_history[idx_center - 3 : idx_center + 1]
+    
+    X_pred_row.loc[X_pred_row.index[0], 'lag96_roll_mean_4'] = np.mean(hist_slice)
+    X_pred_row.loc[X_pred_row.index[0], 'lag96_roll_std_4'] = np.std(hist_slice)
+
+    # Ensemble
+    pred_lgbm = float(lgbm.predict(X_pred_row)[0])
+    pred_xgb = float(xgb_model.predict(X_pred_row)[0])
+    pred_val = ALPHA_LGBM * pred_lgbm + ALPHA_XGB * pred_xgb
+
+    # Relaxed Clipping
+    pred_val = float(np.clip(pred_val, PRICE_Q_LOW, PRICE_Q_HIGH))
     
     predicted_prices.append(pred_val)
     full_history.append(pred_val)
 
 df_pred['Predicted_Price'] = predicted_prices
 
-# Price Smoothing (Generalization layer)
-# Window = 4 is the proven stable value.
-SMOOTHING_WINDOW = 4 
+# Sharper Smoothing (Window=3)
 df_pred['Smoothed_Price'] = df_pred['Predicted_Price'].rolling(window=SMOOTHING_WINDOW, min_periods=1).mean()
 
-print("   Prediction finished and smoothed ✓")
+print("   Prediction finished.")
 
 # ==============================================================================
 # 4. MILP OPTIMIZATION
@@ -206,25 +223,21 @@ print("   Prediction finished and smoothed ✓")
 
 def solve_daily_milp(day_prices):
     T = INTERVALS_PER_DAY
-    prob = pulp.LpProblem("Battery_Trading_Optimization_MILP", pulp.LpMaximize)
+    prob = pulp.LpProblem("Battery_Trading", pulp.LpMaximize)
     
-    # Decision Variables
+    # Variables
     position = pulp.LpVariable.dicts("Position", range(1, T + 1), lowBound=-P_MAX, upBound=P_MAX)
     soc = pulp.LpVariable.dicts("SoC", range(1, T + 1), lowBound=SOC_MIN_MILP, upBound=SOC_MAX_MILP)
     surplus = pulp.LpVariable("Surplus", lowBound=0, upBound=C_MAX)
     
-    # Binary Variables
+    # Binaries
     charge = pulp.LpVariable.dicts("Charge", range(1, T + 1), cat='Binary')
     discharge = pulp.LpVariable.dicts("Discharge", range(1, T + 1), cat='Binary')
 
     pret_minim_zi = min(day_prices)
 
-    # Objective Function: Maximize Profit
-    # Profit = Revenue - Cost
-    # Revenue = (Surplus * P_min) + (Selling_Energy * Price)
-    # Cost = (Buying_Energy * Price)
-    # Effectively: (Surplus * P_min) - Sum(Position * Price)
-    cost_tranzactii = pulp.lpSum([position[t] * day_prices[t-1] for t in range(1, T + 1)])
+    # Objective
+    cost_tranzactii = pulp.lpSum(position[t] * day_prices[t - 1] for t in range(1, T + 1))
     venit_surplus = surplus * pret_minim_zi
     
     prob += venit_surplus - cost_tranzactii, "Profit_Total"
@@ -232,59 +245,46 @@ def solve_daily_milp(day_prices):
     # Constraints
     prob += soc[1] == SOC_START + position[1], "SoC_init"
     for t in range(2, T + 1):
-        prob += soc[t] == soc[t-1] + position[t], f"SoC_t_{t}"
+        prob += soc[t] == soc[t - 1] + position[t], f"SoC_t_{t}"
     prob += soc[T] == surplus, "SoC_Final_Surplus"
 
-    # Constraints for Min Transaction and Mutually Exclusive Actions
     for t in range(1, T + 1):
         prob += charge[t] + discharge[t] == 1, f"Action_Mandatory_{t}"
-        prob += position[t] >= MIN_TRANZACTIE * charge[t] - P_MAX * discharge[t], f"Position_Lower_{t}"
-        prob += position[t] <= P_MAX * charge[t] - MIN_TRANZACTIE * discharge[t], f"Position_Upper_{t}"
+        prob += position[t] >= MIN_TRANZACTIE * charge[t] - P_MAX * discharge[t], f"LB_{t}"
+        prob += position[t] <= P_MAX * charge[t] - MIN_TRANZACTIE * discharge[t], f"UB_{t}"
 
     prob.solve(pulp.PULP_CBC_CMD(msg=0)) 
     
     if pulp.LpStatus[prob.status] == "Optimal":
-        actions = [position[t].varValue if position[t].varValue is not None else 0.0 for t in range(1, T + 1)]
-        return actions
+        return [position[t].varValue if position[t].varValue is not None else 0.0 for t in range(1, T + 1)]
     else:
-        print(f"   Warning: Optimization failed. Status: {pulp.LPStatus[prob.status]}. Using fallback.")
         return [MIN_TRANZACTIE] * T
 
 # Run MILP
 all_actions = []
-print("\n4. MILP Optimization of actions (daily)...")
+print("\n4. MILP Optimization...")
 
 for day in tqdm(range(NUM_DAYS), desc="MILP Solver"):
     start_idx = day * INTERVALS_PER_DAY
     end_idx = (day + 1) * INTERVALS_PER_DAY
-    
-    # Use the Smoothed Prices for robustness
     day_prices = df_pred['Smoothed_Price'][start_idx:end_idx].tolist()
-    
-    actions_day = solve_daily_milp(day_prices)
-    all_actions.extend(actions_day)
+    all_actions.extend(solve_daily_milp(day_prices))
 
-print("   Optimization finished. Total actions: ", len(all_actions))
+print("   Optimization finished.")
 
 # ==============================================================================
-# 5. FINAL EXPORT
+# 5. EXPORT
 # ==============================================================================
 
 final_actions = [round(action, 4) if action is not None else 0.0 for action in all_actions]
 
 def format_time_interval_strict(timestamp):
-    """Generates the required time interval format: DD.MM.YYYY HH:MM - DD.MM.YYYY HH:MM"""
-    start_time = timestamp
-    end_time = timestamp + pd.Timedelta(minutes=15)
-    
-    fmt = '%d.%m.%Y %H:%M'
-    return f"{start_time.strftime(fmt)} - {end_time.strftime(fmt)}"
+    end = timestamp + pd.Timedelta(minutes=15)
+    return f"{timestamp.strftime('%d.%m.%Y %H:%M')} - {end.strftime('%d.%m.%Y %H:%M')}"
 
 submission_df = pd.DataFrame()
 submission_df['Time interval (CET/CEST)'] = df_pred['Start'].apply(format_time_interval_strict)
 submission_df['Position'] = final_actions
 
 submission_df.to_csv('submission.csv', index=False)
-print("\n5. File 'submission.csv' has been generated.")
-print("\n--- First 5 actions (Final Format) ---")
-print(submission_df.head())
+print("\n5. File 'submission.csv' generated.")
