@@ -87,16 +87,4 @@ It contains a validation function you can use to check that your actions:
 Use this function before submitting your strategy.
 
 If one of your actions violate one of the constraints that action will not be taken into account when computing the evaluation metric
-
-
-## Questions
-
-If you need help or clarification, feel free to ask any mentor.
-
-## Notes
-
-Have fun developing your solution and good luck.
-
-## Please don't forget to push all your code to github
-
-# This is the competition link: [Link to kaggle competition](https://www.kaggle.com/t/5af4059e849e433597c960c3050bd4fa)
+This is the competition link: [Link to kaggle competition](https://www.kaggle.com/t/5af4059e849e433597c960c3050bd4fa)
